@@ -1,18 +1,19 @@
 """
 app.py
 
-Weather AI Agent -- a Streamlit chat app powered by Google Gemini's
-function calling and the free, key-less Open-Meteo APIs for real weather data.
+Weather AI Agent -- a Streamlit chat app powered by Groq's function calling
+(OpenAI-compatible API) and the free, key-less Open-Meteo APIs for real
+weather data.
 
 Dependencies (see requirements.txt):
     streamlit
-    google-genai
+    openai
     requests
     python-dotenv
 
-Get a free Gemini API key at: https://aistudio.google.com/apikey
-Set it as GEMINI_API_KEY in a local .env file to avoid asking every visitor
-for their own key; the sidebar field remains as an optional override.
+Get a free Groq API key at: https://console.groq.com/keys
+Set it as GROQ_API_KEY in a local .env file to avoid asking every visitor for
+their own key; the sidebar field remains as an optional override.
 
 Run with:
     streamlit run app.py
@@ -20,24 +21,34 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError, ClientError, ServerError
+from openai import (
+    APIError,
+    AuthenticationError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 
 from weather_tool import get_current_weather
 
 load_dotenv()
-DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+DEFAULT_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-MODEL_NAME = "gemini-3.6-flash"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+MODEL_NAME = "openai/gpt-oss-120b"
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+# Caps how many tool-call round trips the model may make for a single user
+# message, so one ambiguous location can't spiral into repeated API calls.
+MAX_TOOL_CALLS_PER_MESSAGE = 2
+
 SYSTEM_PROMPT = (
     "You are a friendly, knowledgeable weather assistant. Use the "
     "get_current_weather tool whenever the user asks about weather, "
@@ -45,98 +56,141 @@ SYSTEM_PROMPT = (
     "questions (e.g. what to wear, whether to bring an umbrella) using the "
     "most recent weather data already retrieved in this conversation "
     "whenever possible, only calling the tool again if the user asks about "
-    "a new location or wants a fresh reading."
+    "a new location or wants a fresh reading. If the tool returns an error "
+    "that the location could not be found, do NOT retry it with a guessed "
+    "variation of the spelling -- immediately tell the user the location "
+    "wasn't found and ask them to clarify or try a nearby major city."
 )
+
+WEATHER_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_current_weather",
+        "description": (
+            "Get the current real-time weather (temperature, humidity, "
+            "precipitation, wind speed, and general conditions) for a given "
+            "city."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": (
+                        "The city name to get weather for, e.g. 'Paris', "
+                        "'Tokyo', or 'San Francisco, CA'."
+                    ),
+                }
+            },
+            "required": ["location"],
+        },
+    },
+}
 
 
 def init_session_state() -> None:
     """Initialize Streamlit session state on first run."""
-    if "chat_messages" not in st.session_state:
-        # Plain (role, text) pairs used only for rendering the chat history.
-        st.session_state.chat_messages = []
-    if "chat_session" not in st.session_state:
-        st.session_state.chat_session = None
-    if "chat_client" not in st.session_state:
-        # Must be kept alive in session_state: once this Client object is
-        # garbage collected, its underlying HTTP client closes and any chat
-        # session created from it stops working ("client has been closed").
-        st.session_state.chat_client = None
-    if "chat_api_key" not in st.session_state:
-        st.session_state.chat_api_key = None
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
-def get_or_create_chat_session(api_key: str) -> genai.chats.Chat:
-    """Return the active Gemini chat session, recreating it if the key changed."""
-    if st.session_state.chat_session is None or st.session_state.chat_api_key != api_key:
-        client = genai.Client(api_key=api_key)
-        st.session_state.chat_client = client
-        st.session_state.chat_session = client.chats.create(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                tools=[get_current_weather],
-            ),
-        )
-        st.session_state.chat_api_key = api_key
-        st.session_state.chat_messages = []
-    return st.session_state.chat_session
+def get_client(api_key: str) -> OpenAI:
+    """Return an OpenAI-compatible client pointed at Groq's API."""
+    return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
 
 
-def get_last_tool_errors(chat: genai.chats.Chat) -> list[str]:
-    """Inspect the chat history for tool calls that returned an "error" key.
+def run_tool_call(tool_call: Any) -> dict[str, Any]:
+    """Execute a single tool call requested by the model and return its message."""
+    function_name = tool_call.function.name
 
-    Gemini's automatic function calling swallows any exception raised while
-    running a tool and feeds the model {"error": "..."} instead, so the
-    model's reply alone never reveals what actually went wrong. Surfacing
-    this separately lets the UI show the real cause instead of the model's
-    vague paraphrase.
-    """
-    errors: list[str] = []
-    for content in chat.get_history(curated=False)[-4:]:
-        for part in content.parts or []:
-            if not part.function_response:
-                continue
-            response = part.function_response.response or {}
-            tool_result = response.get("result", response)
-            if isinstance(tool_result, dict) and "error" in tool_result:
-                errors.append(f"{part.function_response.name}: {tool_result['error']}")
-            elif "error" in response:
-                errors.append(f"{part.function_response.name}: {response['error']}")
-    return errors
+    if function_name != "get_current_weather":
+        result: dict[str, Any] = {"error": f"Unknown tool requested: {function_name}"}
+    else:
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+        try:
+            result = get_current_weather(**arguments)
+        except Exception as exc:  # noqa: BLE001 - surface any tool failure to the model
+            result = {"error": f"Tool '{function_name}' failed: {exc}"}
+
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": function_name,
+        "content": json.dumps(result),
+    }
 
 
-def send_message_with_retry(chat: genai.chats.Chat, user_input: str) -> types.GenerateContentResponse:
-    """Send a message, retrying on transient 5xx server overload errors.
-
-    Gemini occasionally returns 503 UNAVAILABLE when the model is under
-    heavy demand; this is not caused by the app or the API key and usually
-    clears up within a few seconds.
-    """
-    last_error: Optional[ServerError] = None
+def call_with_retry(client: OpenAI, messages: list[dict[str, Any]]) -> Any:
+    """Call the model, retrying on transient rate-limit (429) and server (5xx) errors."""
+    last_error: Optional[APIError] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return chat.send_message(user_input)
-        except ServerError as exc:
+            return client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=[WEATHER_TOOL_SCHEMA],
+                tool_choice="auto",
+            )
+        except (RateLimitError, InternalServerError) as exc:
             last_error = exc
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
     raise last_error  # type: ignore[misc]
 
 
+def get_assistant_response(client: OpenAI) -> str:
+    """Call the model, resolve any tool calls (capped), and return the final reply text."""
+    response = call_with_retry(client, st.session_state.messages)
+    response_message = response.choices[0].message
+    st.session_state.messages.append(response_message.model_dump(exclude_none=True))
+
+    tool_call_rounds = 0
+    while response_message.tool_calls and tool_call_rounds < MAX_TOOL_CALLS_PER_MESSAGE:
+        tool_call_rounds += 1
+        with st.spinner("Fetching live weather data..."):
+            for tool_call in response_message.tool_calls:
+                st.session_state.messages.append(run_tool_call(tool_call))
+
+        response = call_with_retry(client, st.session_state.messages)
+        response_message = response.choices[0].message
+        st.session_state.messages.append(response_message.model_dump(exclude_none=True))
+
+    return response_message.content or ""
+
+
+def get_last_tool_errors() -> list[str]:
+    """Return any {"error": ...} results from the most recent tool calls, for debugging."""
+    errors: list[str] = []
+    for message in st.session_state.messages[-6:]:
+        if message.get("role") != "tool":
+            continue
+        try:
+            result = json.loads(message["content"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if isinstance(result, dict) and "error" in result:
+            errors.append(f"{message.get('name', 'tool')}: {result['error']}")
+    return errors
+
+
 def render_chat_history() -> None:
-    """Render all stored user/assistant turns."""
-    for role, text in st.session_state.chat_messages:
-        with st.chat_message(role):
-            st.markdown(text)
+    """Render all user/assistant messages (skipping system/tool messages)."""
+    for message in st.session_state.messages:
+        if message["role"] in ("user", "assistant") and message.get("content"):
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
 
 def main() -> None:
     st.set_page_config(page_title="Weather AI Agent", page_icon="\U0001F324️")
     st.title("\U0001F324️ Weather AI Agent")
     st.caption(
-        "Ask about the weather anywhere in the world. Powered by Google "
-        "Gemini function calling and the free Open-Meteo API (no weather "
-        "API key needed)."
+        "Ask about the weather anywhere in the world. Powered by Groq "
+        "function calling and the free Open-Meteo API (no weather API key "
+        "needed)."
     )
 
     with st.sidebar:
@@ -146,7 +200,7 @@ def main() -> None:
             api_key = DEFAULT_API_KEY
             with st.expander("Use a different key instead"):
                 override_key = st.text_input(
-                    "Gemini API Key",
+                    "Groq API Key",
                     type="password",
                     help="Overrides the built-in key for this session only.",
                 )
@@ -154,18 +208,16 @@ def main() -> None:
                     api_key = override_key
         else:
             api_key = st.text_input(
-                "Gemini API Key",
+                "Groq API Key",
                 type="password",
                 help=(
-                    "Get a free key at https://aistudio.google.com/apikey. "
-                    "It is used only for this session and is never stored."
+                    "Get a free key at https://console.groq.com/keys. It is "
+                    "used only for this session and is never stored."
                 ),
             )
         st.markdown("---")
         if st.button("Clear conversation"):
-            st.session_state.chat_session = None
-            st.session_state.chat_client = None
-            st.session_state.chat_messages = []
+            st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             st.rerun()
 
     init_session_state()
@@ -176,39 +228,40 @@ def main() -> None:
         return
 
     if not api_key:
-        st.warning("Please enter your Gemini API key in the sidebar to continue.")
+        st.warning("Please enter your Groq API key in the sidebar to continue.")
         return
 
-    st.session_state.chat_messages.append(("user", user_input))
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
+    client = get_client(api_key)
+
     with st.chat_message("assistant"):
         try:
-            chat = get_or_create_chat_session(api_key)
             with st.spinner("Thinking..."):
-                response = send_message_with_retry(chat, user_input)
-            reply_text = response.text or "(no response)"
-            st.markdown(reply_text)
-            st.session_state.chat_messages.append(("assistant", reply_text))
+                reply_text = get_assistant_response(client)
+            st.markdown(reply_text or "(no response)")
 
-            tool_errors = get_last_tool_errors(chat)
+            tool_errors = get_last_tool_errors()
             if tool_errors:
                 with st.expander("Debug: tool call failed"):
                     for tool_error in tool_errors:
                         st.code(tool_error)
-        except ClientError as exc:
+        except AuthenticationError:
+            st.error("Invalid Groq API key. Please check the key in the sidebar.")
+        except RateLimitError as exc:
             st.error(
-                "Gemini rejected the request -- check that your API key is "
-                f"valid and has quota remaining. Details: {exc}"
+                "Groq's rate limit was hit. Please wait a moment and try "
+                f"again. Details: {exc}"
             )
-        except ServerError as exc:
+        except InternalServerError as exc:
             st.error(
-                "Gemini's servers are temporarily overloaded (this is on "
-                f"Google's side, not this app). Please try again in a moment. Details: {exc}"
+                "Groq's servers are temporarily unavailable (this is on "
+                f"their side, not this app). Please try again shortly. Details: {exc}"
             )
         except APIError as exc:
-            st.error(f"Gemini API error: {exc}")
+            st.error(f"Groq API error: {exc}")
         except Exception as exc:  # noqa: BLE001 - last-resort guard for the UI
             st.error(f"Unexpected error: {exc}")
 
