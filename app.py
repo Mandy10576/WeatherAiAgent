@@ -21,12 +21,14 @@ Run with:
 from __future__ import annotations
 
 import os
+import time
+from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError, ClientError
+from google.genai.errors import APIError, ClientError, ServerError
 
 from weather_tool import get_current_weather
 
@@ -34,6 +36,8 @@ load_dotenv()
 DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 MODEL_NAME = "gemini-3.6-flash"
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2.0
 SYSTEM_PROMPT = (
     "You are a friendly, knowledgeable weather assistant. Use the "
     "get_current_weather tool whenever the user asks about weather, "
@@ -101,6 +105,24 @@ def get_last_tool_errors(chat: genai.chats.Chat) -> list[str]:
     return errors
 
 
+def send_message_with_retry(chat: genai.chats.Chat, user_input: str) -> types.GenerateContentResponse:
+    """Send a message, retrying on transient 5xx server overload errors.
+
+    Gemini occasionally returns 503 UNAVAILABLE when the model is under
+    heavy demand; this is not caused by the app or the API key and usually
+    clears up within a few seconds.
+    """
+    last_error: Optional[ServerError] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return chat.send_message(user_input)
+        except ServerError as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_error  # type: ignore[misc]
+
+
 def render_chat_history() -> None:
     """Render all stored user/assistant turns."""
     for role, text in st.session_state.chat_messages:
@@ -165,7 +187,7 @@ def main() -> None:
         try:
             chat = get_or_create_chat_session(api_key)
             with st.spinner("Thinking..."):
-                response = chat.send_message(user_input)
+                response = send_message_with_retry(chat, user_input)
             reply_text = response.text or "(no response)"
             st.markdown(reply_text)
             st.session_state.chat_messages.append(("assistant", reply_text))
@@ -179,6 +201,11 @@ def main() -> None:
             st.error(
                 "Gemini rejected the request -- check that your API key is "
                 f"valid and has quota remaining. Details: {exc}"
+            )
+        except ServerError as exc:
+            st.error(
+                "Gemini's servers are temporarily overloaded (this is on "
+                f"Google's side, not this app). Please try again in a moment. Details: {exc}"
             )
         except APIError as exc:
             st.error(f"Gemini API error: {exc}")
