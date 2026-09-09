@@ -1,15 +1,22 @@
 """
 app.py
 
-Weather AI Agent -- a Streamlit chat app powered by Groq's function calling
-(OpenAI-compatible API) and the free, key-less Open-Meteo APIs for real
-weather data.
+A two-agent Streamlit app powered by Groq (OpenAI-compatible API):
+
+  * Agent 1 -- Weather & Style Agent: a chat agent using Groq function
+    calling plus the free, key-less Open-Meteo APIs for real weather data.
+  * Agent 2 -- Dress & Fashion Finder Agent: refines a shopper's request into
+    high-intent e-commerce keywords with the LLM, then pulls real product
+    results (title, image, buy link) from DuckDuckGo.
+
+Pick an agent from the sidebar selector.
 
 Dependencies (see requirements.txt):
     streamlit
     openai
     requests
     python-dotenv
+    ddgs
 
 Get a free Groq API key at: https://console.groq.com/keys
 Set it as GROQ_API_KEY in a local .env file to avoid asking every visitor for
@@ -24,18 +31,23 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
+from urllib.parse import urlparse
 
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 from openai import (
     APIError,
     AuthenticationError,
+    BadRequestError,
     InternalServerError,
     OpenAI,
     RateLimitError,
 )
 
+from fashion_tool import search_products_safe
 from weather_tool import get_current_weather
 
 load_dotenv()
@@ -184,41 +196,19 @@ def render_chat_history() -> None:
                 st.markdown(message["content"])
 
 
-def main() -> None:
-    st.set_page_config(page_title="Weather AI Agent", page_icon="\U0001F324️")
-    st.title("\U0001F324️ Weather AI Agent")
+# ---------------------------------------------------------------------------
+# Agent 1 -- Weather & Style Agent
+# ---------------------------------------------------------------------------
+
+
+def render_weather_agent(api_key: str) -> None:
+    """Render the original weather chat agent (logic unchanged)."""
+    st.title("\U0001F324\ufe0f Weather AI Agent")
     st.caption(
         "Ask about the weather anywhere in the world. Powered by Groq "
         "function calling and the free Open-Meteo API (no weather API key "
         "needed)."
     )
-
-    with st.sidebar:
-        st.header("Settings")
-        if DEFAULT_API_KEY:
-            st.success("Using the built-in API key -- no setup needed.")
-            api_key = DEFAULT_API_KEY
-            with st.expander("Use a different key instead"):
-                override_key = st.text_input(
-                    "Groq API Key",
-                    type="password",
-                    help="Overrides the built-in key for this session only.",
-                )
-                if override_key:
-                    api_key = override_key
-        else:
-            api_key = st.text_input(
-                "Groq API Key",
-                type="password",
-                help=(
-                    "Get a free key at https://console.groq.com/keys. It is "
-                    "used only for this session and is never stored."
-                ),
-            )
-        st.markdown("---")
-        if st.button("Clear conversation"):
-            st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            st.rerun()
 
     init_session_state()
     render_chat_history()
@@ -264,6 +254,291 @@ def main() -> None:
             st.error(f"Groq API error: {exc}")
         except Exception as exc:  # noqa: BLE001 - last-resort guard for the UI
             st.error(f"Unexpected error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Agent 2 -- Dress & Fashion Finder Agent
+# ---------------------------------------------------------------------------
+
+FASHION_SYSTEM_PROMPT = (
+    "You rewrite a shopper's request into a short, high-intent e-commerce "
+    "search keyword string. Reply with ONLY that keyword string -- no "
+    "quotes, no explanation, no bullet points. Keep it under 12 words and "
+    "preserve every garment type, colour, fabric, fit, occasion, gender and "
+    "size cue the shopper gave, word for word where possible. Do NOT invent "
+    "or add a gender ('women', 'men', 'unisex'), size, fit, or occasion that "
+    "the shopper did not state or clearly imply -- if they said 'black coat', "
+    "keep it exactly as 'black coat', not 'women black coat'. If the request "
+    "is vague on the garment itself, add the most likely garment noun only. "
+    "Example: 'something sparkly for my friend's evening wedding reception' "
+    "-> 'sequin embellished evening gown wedding reception'."
+)
+FASHION_REFINE_MAX_TOKENS = 200
+FASHION_RESULT_COUNT = 9
+# Fetch extra candidates so that dropping ones with a dead image still
+# leaves close to a full grid.
+FASHION_SEARCH_FETCH_COUNT = 18
+FASHION_GRID_COLUMNS = 3
+FASHION_TITLE_MAX_CHARS = 70
+
+
+def refine_search_keywords(client: OpenAI, raw_query: str) -> str:
+    """
+    Use the LLM to turn a natural-language request into search keywords.
+
+    Falls back to the shopper's own words if the model returns nothing usable,
+    so a flaky refinement never blocks the actual product search.
+    """
+    messages = [
+        {"role": "system", "content": FASHION_SYSTEM_PROMPT},
+        {"role": "user", "content": raw_query},
+    ]
+    try:
+        # gpt-oss is a reasoning model: without a low effort setting and a
+        # generous token budget the reasoning trace eats the whole completion
+        # and `content` comes back empty.
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=FASHION_REFINE_MAX_TOKENS,
+            reasoning_effort="low",
+        )
+    except BadRequestError:
+        # Models that don't accept `reasoning_effort` still work without it.
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=FASHION_REFINE_MAX_TOKENS,
+        )
+
+    keywords = (response.choices[0].message.content or "").strip().strip('"')
+    return keywords or raw_query
+
+
+def truncate_title(title: str) -> str:
+    """Shorten a product title so grid cards stay a consistent height."""
+    clean = " ".join(title.split())
+    if len(clean) <= FASHION_TITLE_MAX_CHARS:
+        return clean
+    return clean[: FASHION_TITLE_MAX_CHARS - 1].rstrip() + "\u2026"
+
+
+IMAGE_FETCH_TIMEOUT_SECONDS = 4
+IMAGE_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_image_bytes(image_url: str) -> Optional[bytes]:
+    """
+    Fetch product image bytes server-side so a dead/blocked link never shows
+    up as Streamlit's raw broken-image icon.
+
+    `st.image(url)` just emits an `<img src="...">` tag, so it can't tell a
+    real image apart from a 404 or a hotlink block -- both render as the
+    browser's placeholder. Fetching the bytes ourselves (with a browser-like
+    User-Agent and a same-site Referer) lets us fall back to a clean caption
+    instead. Cached per URL so re-rendering the same grid stays fast.
+    """
+    try:
+        domain = urlparse(image_url).netloc
+        headers = dict(IMAGE_FETCH_HEADERS)
+        if domain:
+            headers["Referer"] = f"https://{domain}/"
+        response = requests.get(
+            image_url, headers=headers, timeout=IMAGE_FETCH_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        if "image" not in response.headers.get("Content-Type", ""):
+            return None
+        return response.content
+    except requests.RequestException:
+        return None
+
+
+def prefetch_images(products: list[dict[str, str]]) -> dict[str, Optional[bytes]]:
+    """Fetch the image bytes for all products in parallel; returns url -> bytes."""
+    urls = [product["image_url"] for product in products]
+    with ThreadPoolExecutor(max_workers=min(8, len(urls) or 1)) as pool:
+        fetched = list(pool.map(fetch_image_bytes, urls))
+    return dict(zip(urls, fetched))
+
+
+def keep_products_with_images(
+    products: list[dict[str, str]], limit: int
+) -> list[dict[str, str]]:
+    """Drop products whose image failed to load; a listing with no picture isn't useful."""
+    image_bytes_by_url = prefetch_images(products)
+    return [
+        product
+        for product in products
+        if image_bytes_by_url.get(product["image_url"])
+    ][:limit]
+
+
+def render_product_grid(products: list[dict[str, str]]) -> None:
+    """Render products as a responsive grid of image + title + buy link cards."""
+    for row_start in range(0, len(products), FASHION_GRID_COLUMNS):
+        row = products[row_start : row_start + FASHION_GRID_COLUMNS]
+        columns = st.columns(FASHION_GRID_COLUMNS)
+        for column, product in zip(columns, row):
+            with column:
+                st.image(fetch_image_bytes(product["image_url"]), width="stretch")
+                st.markdown(f"**{truncate_title(product['title'])}**")
+                if product.get("source"):
+                    st.caption(product["source"])
+                st.markdown(f"[\U0001F6D2 **Buy now**]({product['product_url']})")
+                st.write("")
+
+
+def run_fashion_search(api_key: str, raw_query: str) -> None:
+    """Refine the query, search for products, and stash the outcome in session state."""
+    client = get_client(api_key)
+
+    try:
+        with st.spinner("Optimizing your search with the LLM..."):
+            keywords = refine_search_keywords(client, raw_query)
+    except AuthenticationError:
+        st.error("Invalid Groq API key. Please check the key in the sidebar.")
+        return
+    except (RateLimitError, InternalServerError, APIError) as exc:
+        st.warning(
+            f"Could not refine the query ({exc}); searching your words as typed."
+        )
+        keywords = raw_query
+
+    with st.spinner(f"Searching the web for '{keywords}'..."):
+        products, error = search_products_safe(
+            keywords, max_results=FASHION_SEARCH_FETCH_COUNT
+        )
+
+    if not error and products:
+        with st.spinner("Checking product images..."):
+            products = keep_products_with_images(products, FASHION_RESULT_COUNT)
+
+    st.session_state.fashion_results = {
+        "raw_query": raw_query,
+        "keywords": keywords,
+        "products": products,
+        "error": error,
+    }
+
+
+def render_fashion_agent(api_key: str) -> None:
+    """Render the dress/fashion product finder agent."""
+    st.title("\U0001F457 Dress & Fashion Finder Agent")
+    st.caption(
+        "Describe what you want to wear in plain English. The LLM turns it "
+        "into an e-commerce search, then the agent pulls real products off "
+        "the web with buy links."
+    )
+
+    with st.form("fashion_search_form"):
+        raw_query = st.text_input(
+            "What are you looking for?",
+            placeholder=(
+                "e.g. red velvet dress, black formal suit, oversized graphic hoodie"
+            ),
+        )
+        submitted = st.form_submit_button("Find outfits")
+
+    if submitted:
+        if not raw_query.strip():
+            st.warning("Please describe the item you're looking for.")
+        elif not api_key:
+            st.warning("Please enter your Groq API key in the sidebar to continue.")
+        else:
+            run_fashion_search(api_key, raw_query.strip())
+
+    results = st.session_state.get("fashion_results")
+    if not results:
+        return
+
+    if results["error"]:
+        st.error(f"Search failed: {results['error']}")
+        return
+
+    if not results["products"]:
+        st.info(
+            f"No products found for '{results['keywords']}'. Try different "
+            "wording, a broader colour, or a more common garment name."
+        )
+        return
+
+    st.success(f"Optimized search: `{results['keywords']}`")
+    render_product_grid(results["products"])
+
+
+# ---------------------------------------------------------------------------
+# Shell -- sidebar navigation shared by both agents
+# ---------------------------------------------------------------------------
+
+WEATHER_AGENT = "\U0001F324\ufe0f Agent 1: Weather & Style"
+FASHION_AGENT = "\U0001F457 Agent 2: Dress & Fashion Finder"
+
+
+def render_sidebar() -> tuple[str, str]:
+    """Render the agent selector plus shared settings; return (agent, api_key)."""
+    with st.sidebar:
+        st.header("Agents")
+        selected_agent = st.radio(
+            "Choose an agent",
+            (WEATHER_AGENT, FASHION_AGENT),
+            label_visibility="collapsed",
+        )
+
+        st.markdown("---")
+        st.header("Settings")
+        if DEFAULT_API_KEY:
+            st.success("Using the built-in API key -- no setup needed.")
+            api_key = DEFAULT_API_KEY
+            with st.expander("Use a different key instead"):
+                override_key = st.text_input(
+                    "Groq API Key",
+                    type="password",
+                    help="Overrides the built-in key for this session only.",
+                )
+                if override_key:
+                    api_key = override_key
+        else:
+            api_key = st.text_input(
+                "Groq API Key",
+                type="password",
+                help=(
+                    "Get a free key at https://console.groq.com/keys. It is "
+                    "used only for this session and is never stored."
+                ),
+            )
+
+        st.markdown("---")
+        if selected_agent == WEATHER_AGENT:
+            if st.button("Clear conversation"):
+                st.session_state.messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT}
+                ]
+                st.rerun()
+        elif st.button("Clear results"):
+            st.session_state.pop("fashion_results", None)
+            st.rerun()
+
+    return selected_agent, api_key
+
+
+def main() -> None:
+    st.set_page_config(page_title="Multi-Agent AI Studio", page_icon="\U0001F916")
+
+    selected_agent, api_key = render_sidebar()
+
+    if selected_agent == FASHION_AGENT:
+        render_fashion_agent(api_key)
+    else:
+        render_weather_agent(api_key)
 
 
 if __name__ == "__main__":
