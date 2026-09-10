@@ -48,6 +48,13 @@ from openai import (
 )
 
 from fashion_tool import search_products_safe
+from pdf_tool import (
+    PdfProcessingError,
+    build_index_from_pdf,
+    is_broad_query,
+    sample_chunks,
+    search as search_pdf_index,
+)
 from weather_tool import get_current_weather
 
 load_dotenv()
@@ -476,11 +483,161 @@ def render_fashion_agent(api_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shell -- sidebar navigation shared by both agents
+# Agent 3 -- PDF Q&A Agent
+# ---------------------------------------------------------------------------
+
+PDF_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a document assistant. Answer the user's question using ONLY the "
+    "excerpts from their PDF given below as context -- do not use outside "
+    "knowledge. If the excerpts don't contain the answer, say clearly that "
+    "the document doesn't seem to cover that, instead of guessing.\n\n"
+    "--- PDF excerpts ---\n{context}\n--- end of excerpts ---"
+)
+PDF_TOP_K_CHUNKS = 4
+PDF_BROAD_SAMPLE_CHUNKS = 6
+PDF_ANSWER_MAX_TOKENS = 500
+
+
+def process_uploaded_pdf(uploaded_file: Any) -> None:
+    """Extract, chunk, and index an uploaded PDF; store the index in session state."""
+    try:
+        with st.spinner(f"Reading {uploaded_file.name}..."):
+            index = build_index_from_pdf(uploaded_file)
+    except PdfProcessingError as exc:
+        st.session_state.pdf_index = None
+        st.session_state.pdf_error = str(exc)
+        return
+
+    st.session_state.pdf_index = index
+    st.session_state.pdf_name = uploaded_file.name
+    st.session_state.pdf_error = None
+    st.session_state.pdf_qa_history = []
+
+
+def answer_from_pdf(client: OpenAI, question: str) -> tuple[str, list[str]]:
+    """Retrieve relevant chunks and ask the LLM to answer using only them."""
+    index = st.session_state.pdf_index
+
+    if is_broad_query(question):
+        # Overview-style questions ("what's in this pdf?", "summarize it")
+        # rarely share keywords with the document's own body text, so
+        # keyword-overlap search would score everything near zero. Give the
+        # LLM a spread of chunks across the whole document instead.
+        context_chunks = sample_chunks(index, max_chunks=PDF_BROAD_SAMPLE_CHUNKS)
+    else:
+        matches = search_pdf_index(index, question, top_k=PDF_TOP_K_CHUNKS)
+        if not matches:
+            return (
+                "I couldn't find anything in the document related to that "
+                "question. Try rephrasing it or asking about a topic the PDF "
+                "actually covers.",
+                [],
+            )
+        context_chunks = [chunk for chunk, _score in matches]
+
+    context = "\n\n".join(
+        f"[Excerpt {i + 1}]\n{chunk}" for i, chunk in enumerate(context_chunks)
+    )
+    system_prompt = PDF_SYSTEM_PROMPT_TEMPLATE.format(context=context)
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.2,
+        max_tokens=PDF_ANSWER_MAX_TOKENS,
+    )
+    answer = (response.choices[0].message.content or "").strip()
+    return answer or "The model returned an empty response -- please try again.", context_chunks
+
+
+def render_pdf_agent(api_key: str) -> None:
+    """Render the PDF Q&A agent: upload a PDF, then ask questions about it."""
+    st.title("\U0001F4C4 PDF Q&A Agent")
+    st.caption(
+        "Upload a PDF, then ask questions about it. The agent retrieves the "
+        "most relevant parts of the document and answers using only that "
+        "content."
+    )
+
+    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
+    if uploaded_file is not None and st.session_state.get("pdf_name") != uploaded_file.name:
+        process_uploaded_pdf(uploaded_file)
+
+    if st.session_state.get("pdf_error"):
+        st.error(st.session_state.pdf_error)
+        return
+
+    if not st.session_state.get("pdf_index"):
+        st.info("Upload a PDF above to start asking questions about it.")
+        return
+
+    st.success(f"Loaded **{st.session_state.pdf_name}** -- ready for questions.")
+
+    for entry in st.session_state.get("pdf_qa_history", []):
+        with st.chat_message("user"):
+            st.markdown(entry["question"])
+        with st.chat_message("assistant"):
+            st.markdown(entry["answer"])
+            if entry["sources"]:
+                with st.expander("Sources used from the PDF"):
+                    for i, chunk in enumerate(entry["sources"]):
+                        st.caption(f"Excerpt {i + 1}")
+                        st.text(chunk)
+
+    question = st.chat_input("Ask a question about the uploaded PDF...")
+    if not question:
+        return
+
+    if not api_key:
+        st.warning("Please enter your Groq API key in the sidebar to continue.")
+        return
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    client = get_client(api_key)
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("Searching the document and thinking..."):
+                answer, sources = answer_from_pdf(client, question)
+            st.markdown(answer)
+            if sources:
+                with st.expander("Sources used from the PDF"):
+                    for i, chunk in enumerate(sources):
+                        st.caption(f"Excerpt {i + 1}")
+                        st.text(chunk)
+        except AuthenticationError:
+            st.error("Invalid Groq API key. Please check the key in the sidebar.")
+            return
+        except RateLimitError as exc:
+            st.error(f"Groq's rate limit was hit. Please wait a moment and try again. Details: {exc}")
+            return
+        except InternalServerError as exc:
+            st.error(f"Groq's servers are temporarily unavailable. Please try again shortly. Details: {exc}")
+            return
+        except APIError as exc:
+            st.error(f"Groq API error: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - last-resort guard for the UI
+            st.error(f"Unexpected error: {exc}")
+            return
+
+    st.session_state.setdefault("pdf_qa_history", []).append(
+        {"question": question, "answer": answer, "sources": sources}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shell -- sidebar navigation shared by all agents
 # ---------------------------------------------------------------------------
 
 WEATHER_AGENT = "\U0001F324\ufe0f Agent 1: Weather & Style"
 FASHION_AGENT = "\U0001F457 Agent 2: Dress & Fashion Finder"
+PDF_AGENT = "\U0001F4C4 Agent 3: PDF Q&A"
 
 
 def render_sidebar() -> tuple[str, str]:
@@ -489,7 +646,7 @@ def render_sidebar() -> tuple[str, str]:
         st.header("Agents")
         selected_agent = st.radio(
             "Choose an agent",
-            (WEATHER_AGENT, FASHION_AGENT),
+            (WEATHER_AGENT, FASHION_AGENT, PDF_AGENT),
             label_visibility="collapsed",
         )
 
@@ -523,8 +680,13 @@ def render_sidebar() -> tuple[str, str]:
                     {"role": "system", "content": SYSTEM_PROMPT}
                 ]
                 st.rerun()
-        elif st.button("Clear results"):
-            st.session_state.pop("fashion_results", None)
+        elif selected_agent == FASHION_AGENT:
+            if st.button("Clear results"):
+                st.session_state.pop("fashion_results", None)
+                st.rerun()
+        elif st.button("Clear PDF"):
+            for key in ("pdf_index", "pdf_name", "pdf_error", "pdf_qa_history"):
+                st.session_state.pop(key, None)
             st.rerun()
 
     return selected_agent, api_key
@@ -537,6 +699,8 @@ def main() -> None:
 
     if selected_agent == FASHION_AGENT:
         render_fashion_agent(api_key)
+    elif selected_agent == PDF_AGENT:
+        render_pdf_agent(api_key)
     else:
         render_weather_agent(api_key)
 
